@@ -1,141 +1,62 @@
-import os, sys
+import os
+import sys
+import creart
 sys.path.append(os.getcwd())
-
-import utils.exithooks
-from io import BytesIO
-from typing import Union
-from typing_extensions import Annotated
-from graia.ariadne.app import Ariadne
-from graia.ariadne.connection.config import (
-    HttpClientConfig,
-    WebsocketClientConfig,
-    config as ariadne_config,
-)
-from graia.ariadne.message import Source
-from graia.ariadne.message.chain import MessageChain
-from graia.ariadne.message.parser.base import DetectPrefix, MentionMe
-from graia.ariadne.event.mirai import NewFriendRequestEvent, BotInvitedJoinGroupRequestEvent
-from graia.ariadne.message.element import Image
-from graia.ariadne.model import Friend, Group
-from loguru import logger
-
+from asyncio import AbstractEventLoop
 import asyncio
-import chatbot
-from config import Config
-from text_to_img import text_to_image
+from utils.exithooks import hook
+from loguru import logger
+from constants import config, botManager
+from utils.edge_tts import load_edge_tts_voices
 
+loop = creart.create(AbstractEventLoop)
 
-config = Config.load_config()
-# Refer to https://graia.readthedocs.io/ariadne/quickstart/
-app = Ariadne(
-    ariadne_config(
-        config.mirai.qq,  # 配置详见 config.json
-        config.mirai.api_key,
-        HttpClientConfig(host=config.mirai.http_url),
-        WebsocketClientConfig(host=config.mirai.ws_url),
-    ),
-)
-queue_size = 0
-queue_lock = None
+loop.run_until_complete(botManager.login())
 
-async def create_timeout_task(target: Union[Friend, Group], source: Source):
-    await asyncio.sleep(config.response.timeout)
-    await app.send_message(target, config.response.timeout_format, quote=source if config.response.quote else False)
+bots = []
 
-async def handle_message(target: Union[Friend, Group], session_id: str, message: str, source: Source) -> str:
-    if not message.strip():
-        return config.response.placeholder
-    
-    global queue_lock, queue_size
-    if queue_lock is None:
-        queue_lock = asyncio.Lock()
+# 将log输出到stdout
+logger.configure(handlers=[{"sink": sys.stdout}])
 
-    timeout_task = None
+if config.mirai:
+    logger.info("检测到 mirai 配置，将启动 mirai 模式……")
+    from platforms.ariadne_bot import start_task
 
-    session, is_new_session = chatbot.get_chat_session(session_id)
-    
-    # 回滚
-    if message.strip() in config.trigger.rollback_command:
-        resp = session.rollback_conversation()
-        if resp:
-            return config.response.rollback_success + '\n' + resp
-        return config.response.rollback_fail
+    bots.append(loop.create_task(start_task()))
 
-    # 队列满时拒绝新的消息
-    if config.response.max_queue_size > 0 and queue_size > config.response.max_queue_size:
-        return config.response.queue_full
-    else:
-        # 提示用户：请求已加入队列
-        if queue_size > config.response.queued_notice_size:
-            await app.send_message(target, config.response.queued_notice.format(queue_size=queue_size), quote=source if config.response.quote else False)
+if config.onebot:
+    logger.info("检测到 Onebot 配置，将启动 Onebot 模式……")
+    from platforms.onebot_bot import start_task
 
-    # 以下开始需要排队
-    queue_size = queue_size + 1
-    async with queue_lock:
-        try:
+    bots.append(loop.create_task(start_task()))
+if config.telegram:
+    logger.info("检测到 telegram 配置，将启动 telegram bot 模式……")
+    from platforms.telegram_bot import start_task
 
-            timeout_task = asyncio.create_task(create_timeout_task(target, source))
+    bots.append(loop.create_task(start_task()))
+if config.discord:
+    logger.info("检测到 discord 配置，将启动 discord bot 模式……")
+    from platforms.discord_bot import start_task
 
-            # 重置会话
-            if message.strip() in config.trigger.reset_command:
-                session.reset_conversation()
-                await chatbot.initial_process(session)
-                return config.response.reset
+    bots.append(loop.create_task(start_task()))
+if config.http:
+    logger.info("检测到 http 配置，将启动 http service 模式……")
+    from platforms.http_service import start_task
 
-            # 新会话
-            if is_new_session:
-                await chatbot.initial_process(session)
+    bots.append(loop.create_task(start_task()))
+if config.wecom:
+    logger.info("检测到 Wecom 配置，将启动 Wecom Bot 模式……")
+    from platforms.wecom_bot import start_task
 
-            # 加载关键词人设
-            resp = await chatbot.keyword_presets_process(session, message)
-            if resp:
-                logger.debug(f"{session_id} - {resp}")
-                return resp
+    bots.append(loop.create_task(start_task()))
+try:
+    logger.info("[Edge TTS] 读取 Edge TTS 可用音色列表……")
+    loop.run_until_complete(load_edge_tts_voices())
+    logger.info("[Edge TTS] 读取成功！")
+except Exception as e:
+    logger.exception(e)
+    logger.error("[Edge TTS] 读取失败！")
 
-            # 正常交流
-            resp = await session.get_chat_response(message)
-            if resp:
-                logger.debug(f"{session_id} - {resp}")
-                return resp.strip()
-        except Exception as e:
-            if str(e)  == "('Response code error: ', 429)" or 'overloaded' in str(e):
-                return config.response.request_too_fast
-            logger.exception(e)
-            return config.response.error_format.format(exc=e)
-        finally:
-            queue_size = queue_size - 1
-            if timeout_task:
-                timeout_task.cancel()
-    ### 排队结束
-
-
-@app.broadcast.receiver("FriendMessage")
-async def friend_message_listener(app: Ariadne, friend: Friend, source: Source, chain: Annotated[MessageChain, DetectPrefix(config.trigger.prefix)]):
-    if friend.id == config.mirai.qq:
-        return
-    response = await handle_message(friend, f"friend-{friend.id}", chain.display, source)
-    await app.send_message(friend, response, quote=source if config.response.quote else False)
-
-GroupTrigger = Annotated[MessageChain, MentionMe(config.trigger.require_mention != "at"), DetectPrefix(config.trigger.prefix)] if config.trigger.require_mention != "none" else Annotated[MessageChain, DetectPrefix(config.trigger.prefix)]
-
-@app.broadcast.receiver("GroupMessage")
-async def group_message_listener(group: Group, source: Source, chain: GroupTrigger):
-    response = await handle_message(group, f"group-{group.id}", chain.display, source)
-    event = await app.send_message(group, response)
-    if event.source.id < 0:
-        img = text_to_image(text=response)
-        b = BytesIO()
-        img.save(b, format="png")
-        await app.send_message(group, Image(data_bytes=b.getvalue()), quote=source if config.response.quote else False)
-
-@app.broadcast.receiver("NewFriendRequestEvent")
-async def on_friend_request(event: NewFriendRequestEvent):
-    if config.system.accept_friend_request:
-        await event.accept()
-
-@app.broadcast.receiver("BotInvitedJoinGroupRequestEvent")
-async def on_friend_request(event: BotInvitedJoinGroupRequestEvent):
-    if config.system.accept_group_invite:
-        await event.accept()
-
-app.launch_blocking()
+hook()
+loop.run_until_complete(asyncio.gather(*bots))
+loop.run_forever()
